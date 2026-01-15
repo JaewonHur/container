@@ -267,11 +267,13 @@ extension SandboxClient {
         do {
             _ = try await self.client.send(request)
         } catch {
-            throw ContainerizationError(
-                .internalError,
-                message: "failed to shutdown container \(self.id)",
-                cause: error
-            )
+            guard let err = error as? ContainerizationError, err.code == .interrupted else {
+                throw ContainerizationError(
+                    .internalError,
+                    message: "failed to shutdown container \(self.id)",
+                    cause: error
+                )
+            }
         }
     }
 
