@@ -51,6 +51,7 @@ public actor RuntimeService {
     private var processes: [String: ProcessInfo] = [:]
     private var socketForwarders: [SocketForwarderResult] = []
     private var networkSessions: [XPCClientSession] = []
+    private var memoryBalloonTask: Task<Void, Never>?
 
     private static let sshAuthSocketGuestPath = "/var/host-services/ssh-auth.sock"
     private static let sshAuthSocketEnvVar = "SSH_AUTH_SOCK"
@@ -979,6 +980,109 @@ public actor RuntimeService {
             self.setState(.stopped)
             throw error
         }
+
+        self.startMemoryBalloonMonitor()
+    }
+
+    /// Periodically sample the container's memory statistics and resize the VM's memory
+    /// through the virtio balloon.
+    ///
+    /// Replaces any monitor already running. The monitor is stopped when the container is cleaned up.
+    private func startMemoryBalloonMonitor(
+        interval: Duration = .seconds(5)
+    ) {
+        guard let info = self.container else {
+            return
+        }
+        self.memoryBalloonTask?.cancel()
+
+        let container = info.container
+        let log = self.log
+        let mib: UInt64 = 1 << 20
+        // Matches the VM memory computed in `bootstrap`, rounded up to MiB like the VZ configuration.
+        let vmMemory = info.config.resources.memoryInBytes + VMResources.guestMemoryOverhead
+        let configured = (vmMemory + mib - 1) / mib * mib
+
+        self.memoryBalloonTask = Task {
+            var policy = WorkingSetBalloonPolicy()
+            var currentTarget = configured
+
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: interval)
+
+                    guard let memory = try await container.statistics(categories: .memory).memory else {
+                        continue
+                    }
+                    let proposed = policy.nextTarget(stats: memory, currentTarget: currentTarget, configured: configured)
+                    let target = min((proposed + mib - 1) / mib * mib, configured)
+                    guard target != currentTarget else {
+                        continue
+                    }
+
+                    let applied = try await Self.setVirtualMachineMemoryTarget(
+                        container: container,
+                        target: target,
+                        compactFirst: target < currentTarget,
+                        log: log
+                    )
+                    guard applied else {
+                        log.info("vm has no memory balloon support; stopping memory monitor")
+                        return
+                    }
+                    log.debug(
+                        "updated vm memory target",
+                        metadata: ["from": "\(currentTarget)", "to": "\(target)"]
+                    )
+                    currentTarget = target
+                } catch is CancellationError {
+                    return
+                } catch {
+                    log.debug("memory balloon update failed", metadata: ["error": "\(error)"])
+                }
+            }
+        }
+    }
+
+    /// Ask the VM to keep `target` bytes of memory.
+    ///
+    /// - Parameters:
+    ///   - compactFirst: Compact guest memory before applying the target, so the balloon can take
+    ///     larger contiguous chunks. The kernel may not expose `vm.compact_memory`, so a failure
+    ///     is only logged.
+    ///
+    /// - Returns: `false` if the VM doesn't support a memory balloon.
+    private static func setVirtualMachineMemoryTarget(
+        container: LinuxContainer,
+        target: UInt64,
+        compactFirst: Bool,
+        log: Logger
+    ) async throws -> Bool {
+        try await container.withVirtualMachineInstance { vm in
+            guard let vz = vm as? VZVirtualMachineInstance else {
+                return false
+            }
+            if compactFirst {
+                do {
+                    let agent = try await vz.dialAgent()
+                    do {
+                        try await agent.sysctl(settings: ["vm.compact_memory": "1"])
+                    } catch {
+                        log.debug("failed to compact guest memory", metadata: ["error": "\(error)"])
+                    }
+                    try await agent.close()
+                } catch {
+                    log.debug("failed to reach guest agent for compaction", metadata: ["error": "\(error)"])
+                }
+            }
+            try await vz.setTargetVirtualMachineMemory(size: target)
+            return true
+        }
+    }
+
+    private func stopMemoryBalloonMonitor() {
+        self.memoryBalloonTask?.cancel()
+        self.memoryBalloonTask = nil
     }
 
     private func startExecProcess(processId id: String, lock: AsyncLock.Context) async throws {
@@ -1404,6 +1508,8 @@ public actor RuntimeService {
     private func cleanUpContainer(containerInfo: ContainerInfo, exitStatus: ExitStatus? = nil) async throws {
         let container = containerInfo.container
         let id = container.id
+
+        self.stopMemoryBalloonMonitor()
 
         do {
             try await container.stop()
